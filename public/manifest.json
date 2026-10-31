@@ -1,0 +1,17 @@
+{
+  "name": "مكتبة الوالدين",
+  "short_name": "المكتبة",
+  "description": "تطبيق القراءة المريح والمبسط لمشاركة الكتب مع الوالدين",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5ecd8",
+  "theme_color": "#f5ecd8",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/book-icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml"
+    }
+  ]
+}
