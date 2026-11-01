@@ -1,23 +1,19 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import * as pdfjsLib from 'pdfjs-dist';
+import mupdf from './mupdfEngine';
 import {
   ArrowRight,
   ZoomIn,
   ZoomOut,
   Palette,
   Bookmark,
+  BookmarkCheck,
   ChevronLeft,
   ChevronRight,
   RotateCcw,
+  CheckCircle2,
 } from 'lucide-react';
-import { type BookRecord, updateReadingProgress } from './db';
+import { type BookRecord, getSavedProgress, saveBookmarkProgress } from './db';
 import { THEMES, type ThemeId } from './themes';
-
-// Setup pdfjs worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url
-).toString();
 
 interface ReaderProps {
   book: BookRecord;
@@ -25,367 +21,401 @@ interface ReaderProps {
 }
 
 export const Reader: React.FC<ReaderProps> = ({ book, onBack }) => {
-  const [currentPage, setCurrentPage] = useState<number>(book.lastReadPage || 1);
+  // Current active page during browsing
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  // Saved permanent bookmark page (only changes when user explicitly taps Save)
+  const [savedBookmarkPage, setSavedBookmarkPage] = useState<number>(book.lastReadPage || 1);
   const [totalPages, setTotalPages] = useState<number>(book.totalPages || 1);
   const [zoomLevel, setZoomLevel] = useState<number>(book.zoomLevel || 1.15);
   const [themeId, setThemeId] = useState<ThemeId>((book.theme as ThemeId) || 'sepia');
-  const [bookmarks, setBookmarks] = useState<number[]>(book.bookmarks || []);
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
   const [isJumpModalOpen, setIsJumpModalOpen] = useState(false);
   const [jumpPageInput, setJumpPageInput] = useState('');
   const [isRendering, setIsRendering] = useState(true);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [saveToast, setSaveToast] = useState<string | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
-  const renderTaskRef = useRef<any>(null);
-  const debounceSaveTimer = useRef<number | null>(null);
+  const mupdfDocRef = useRef<any>(null);
+  const isMountedRef = useRef(true);
 
   const theme = THEMES[themeId] || THEMES.sepia;
-  const isBookmarked = bookmarks.includes(currentPage);
+  const isCurrentPageSaved = savedBookmarkPage === currentPage;
 
-  // 1. Load PDF Document (Virtual stream from memory)
+  // 1. Initialize MuPDF Document (Local ArrayBuffer or fetch online URL)
   useEffect(() => {
-    let isCancelled = false;
+    isMountedRef.current = true;
+    let docInstance: any = null;
 
-    async function loadDoc() {
+    async function initDocument() {
       try {
         setIsRendering(true);
-        // Load clean copy of ArrayBuffer
-        const loadingTask = pdfjsLib.getDocument({
-          data: new Uint8Array(book.pdfData),
-          cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/cmaps/',
-          cMapPacked: true,
-          standardFontDataUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/standard_fonts/',
-        });
+        setRenderError(null);
 
-        const doc = await loadingTask.promise;
-        if (isCancelled) return;
-        pdfDocRef.current = doc;
-        setTotalPages(doc.numPages);
-      } catch (err) {
-        console.error('Failed to load PDF doc', err);
+        // Check if there is saved bookmark progress in DB
+        const progress = await getSavedProgress(book.id);
+        const startPage = progress?.lastReadPage || book.lastReadPage || 1;
+        setSavedBookmarkPage(startPage);
+        setCurrentPage(startPage);
+        if (progress?.zoomLevel) setZoomLevel(progress.zoomLevel);
+        if (progress?.theme) setThemeId(progress.theme as ThemeId);
+
+        let pdfBuffer: ArrayBuffer;
+        if (book.pdfData) {
+          pdfBuffer = book.pdfData;
+        } else if (book.pdfUrl) {
+          const res = await fetch(book.pdfUrl);
+          if (!res.ok) throw new Error('فشل تحميل ملف الكتاب من الخادم');
+          pdfBuffer = await res.arrayBuffer();
+        } else {
+          throw new Error('لا توجد بيانات متاحة لهذا الكتاب');
+        }
+
+        if (!isMountedRef.current) return;
+
+        // Open Document in MuPDF WebAssembly
+        docInstance = mupdf.Document.openDocument(pdfBuffer, 'application/pdf');
+        mupdfDocRef.current = docInstance;
+
+        const count = docInstance.countPages();
+        setTotalPages(count);
+
+        // Render target page
+        renderPage(docInstance, startPage, zoomLevel);
+      } catch (err: any) {
+        console.error('MuPDF load error:', err);
+        if (isMountedRef.current) {
+          setRenderError(err.message || 'حدث خطأ أثناء فتح صفحات الكتاب');
+          setIsRendering(false);
+        }
       }
     }
 
-    loadDoc();
+    initDocument();
 
     return () => {
-      isCancelled = true;
-      if (pdfDocRef.current && (pdfDocRef.current as any).destroy) {
-        (pdfDocRef.current as any).destroy();
-      }
+      isMountedRef.current = false;
+      mupdfDocRef.current = null;
     };
-  }, [book.id, book.pdfData]);
+  }, [book.id]);
 
-  // 2. High-DPI Vector Render for the current page only
-  const renderCurrentPage = useCallback(async () => {
-    if (!pdfDocRef.current || !canvasRef.current) return;
+  // 2. High-Fidelity Native Vector Arabic Rendering with MuPDF
+  const renderPage = useCallback(
+    async (docOverride?: any, pageNum?: number, zoom?: number) => {
+      const doc = docOverride || mupdfDocRef.current;
+      const targetPage = pageNum ?? currentPage;
+      const targetZoom = zoom ?? zoomLevel;
 
+      if (!doc || !canvasRef.current) return;
+
+      try {
+        setIsRendering(true);
+        const pageIndex = Math.max(0, Math.min(targetPage - 1, totalPages - 1));
+        const page = doc.loadPage(pageIndex);
+        const bounds = page.getBounds(); // [x0, y0, x1, y1]
+        const origWidth = bounds[2] - bounds[0] || 600;
+
+        const containerWidth = Math.min(window.innerWidth - 32, 900);
+        const baseScale = containerWidth / origWidth;
+        const dpr = Math.min(window.devicePixelRatio || 1.5, 2.5);
+        const effectiveScale = Math.max(1.0, baseScale * targetZoom * dpr);
+
+        const matrix = mupdf.Matrix.scale(effectiveScale, effectiveScale);
+        // RGBA pixmap for direct canvas blit
+        const pixmap = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, true);
+        const width = pixmap.getWidth();
+        const height = pixmap.getHeight();
+        const pixels = pixmap.getPixels();
+
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        canvas.width = width;
+        canvas.height = height;
+        canvas.style.width = `${Math.floor(width / dpr)}px`;
+        canvas.style.height = `${Math.floor(height / dpr)}px`;
+
+        const imgData = new ImageData(pixels, width, height);
+        ctx.putImageData(imgData, 0, 0);
+
+        setIsRendering(false);
+      } catch (err) {
+        console.error('MuPDF renderPage error:', err);
+        setIsRendering(false);
+      }
+    },
+    [currentPage, zoomLevel, totalPages]
+  );
+
+  // Re-render when page or zoom changes
+  const handlePageChange = (newPage: number) => {
+    if (newPage < 1 || newPage > totalPages) return;
+    setCurrentPage(newPage);
+    renderPage(mupdfDocRef.current, newPage, zoomLevel);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleZoom = (delta: number) => {
+    const newZoom = Math.min(Math.max(0.7, zoomLevel + delta), 2.5);
+    setZoomLevel(newZoom);
+    renderPage(mupdfDocRef.current, currentPage, newZoom);
+  };
+
+  const handleResetZoom = () => {
+    const def = 1.15;
+    setZoomLevel(def);
+    renderPage(mupdfDocRef.current, currentPage, def);
+  };
+
+  // 3. Explicit Bookmark Save Function (Requested by User)
+  // Only updates permanent resume position when user clicks this button!
+  const handleExplicitSaveBookmark = async () => {
     try {
-      if (renderTaskRef.current) {
-        renderTaskRef.current.cancel();
-      }
-
-      setIsRendering(true);
-      const page = await pdfDocRef.current.getPage(currentPage);
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      // Base viewport: fit width comfortably on screen
-      const containerWidth = Math.min(window.innerWidth - 32, 900);
-      const unscaledViewport = page.getViewport({ scale: 1.0 });
-      const baseScale = containerWidth / unscaledViewport.width;
-      const effectiveScale = baseScale * zoomLevel;
-
-      // High DPI retina crispness (sharp text for elderly eyes)
-      const outputScale = window.devicePixelRatio || 1;
-      const viewport = page.getViewport({ scale: effectiveScale });
-
-      canvas.width = Math.floor(viewport.width * outputScale);
-      canvas.height = Math.floor(viewport.height * outputScale);
-      canvas.style.width = `${Math.floor(viewport.width)}px`;
-      canvas.style.height = `${Math.floor(viewport.height)}px`;
-
-      ctx.save();
-      ctx.scale(outputScale, outputScale);
-
-      const renderContext: any = {
-        canvasContext: ctx,
-        viewport,
-        enableWebGL: true,
-      };
-
-      const renderTask = page.render(renderContext);
-      renderTaskRef.current = renderTask;
-      await renderTask.promise;
-      ctx.restore();
-      setIsRendering(false);
-    } catch (err: any) {
-      if (err?.name !== 'RenderingCancelledException') {
-        console.error('Page render error', err);
-      }
-    }
-  }, [currentPage, zoomLevel]);
-
-  useEffect(() => {
-    renderCurrentPage();
-  }, [renderCurrentPage]);
-
-  // 3. Auto-save progress seamlessly to IndexedDB
-  useEffect(() => {
-    if (debounceSaveTimer.current) {
-      window.clearTimeout(debounceSaveTimer.current);
-    }
-    debounceSaveTimer.current = window.setTimeout(() => {
-      updateReadingProgress(book.id, {
+      await saveBookmarkProgress(book.id, {
         lastReadPage: currentPage,
         zoomLevel,
         theme: themeId,
-        bookmarks,
       });
-    }, 1000);
+      setSavedBookmarkPage(currentPage);
 
-    return () => {
-      if (debounceSaveTimer.current) window.clearTimeout(debounceSaveTimer.current);
-    };
-  }, [book.id, currentPage, zoomLevel, themeId, bookmarks]);
-
-  // Navigation handlers
-  const handleNextPage = () => {
-    if (currentPage < totalPages) {
-      setCurrentPage((p) => p + 1);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-  };
-
-  const handlePrevPage = () => {
-    if (currentPage > 1) {
-      setCurrentPage((p) => p - 1);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-  };
-
-  const toggleBookmark = () => {
-    if (isBookmarked) {
-      setBookmarks((b) => b.filter((p) => p !== currentPage));
-    } else {
-      setBookmarks((b) => [...b, currentPage]);
-    }
-  };
-
-  const handleJumpToPage = (e: React.FormEvent) => {
-    e.preventDefault();
-    const p = parseInt(jumpPageInput, 10);
-    if (!isNaN(p) && p >= 1 && p <= totalPages) {
-      setCurrentPage(p);
-      setIsJumpModalOpen(false);
-      setJumpPageInput('');
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setSaveToast(`✓ تم حفظ علامة القراءة عند صفحة ${currentPage}. سيبدأ الكتاب دائماً من هنا.`);
+      setTimeout(() => setSaveToast(null), 4000);
+    } catch (err) {
+      console.error('Failed to save bookmark:', err);
     }
   };
 
   return (
     <div
-      className="min-h-screen flex flex-col transition-colors duration-200 select-none pb-28"
-      style={{ backgroundColor: theme.bg }}
+      className="min-h-screen flex flex-col transition-colors duration-300 font-sans"
+      style={{ backgroundColor: theme.bg, color: theme.textColor }}
     >
-      {/* 1. Header (Touch target min 56px, high contrast) */}
+      {/* Toast Notification for Bookmark Save */}
+      {saveToast && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-emerald-800 text-white px-6 py-3.5 rounded-2xl shadow-2xl flex items-center gap-3 text-base sm:text-lg font-bold border-2 border-emerald-400 animate-bounce">
+          <CheckCircle2 className="w-6 h-6 text-emerald-300 shrink-0" />
+          <span>{saveToast}</span>
+        </div>
+      )}
+
+      {/* Top Header Bar */}
       <header
-        className="sticky top-0 z-30 flex items-center justify-between px-4 py-3 shadow-sm border-b"
+        className="sticky top-0 z-40 px-3 py-2.5 sm:px-6 sm:py-3 shadow-md flex items-center justify-between border-b"
         style={{
           backgroundColor: theme.headerBg,
           borderColor: 'rgba(0,0,0,0.08)',
-          color: theme.textColor,
         }}
       >
+        {/* Bookmark Save Button (Requested explicitly by user) */}
         <button
-          onClick={onBack}
-          className="flex items-center gap-2 px-4 py-2.5 rounded-2xl font-bold text-lg cursor-pointer active:scale-95 transition-transform"
-          style={{ backgroundColor: 'rgba(0,0,0,0.05)' }}
-          aria-label="الرجوع للمكتبة"
+          onClick={handleExplicitSaveBookmark}
+          title="حفظ موضع القراءة الحالي للعودة إليه دائماً"
+          className={`flex items-center gap-2 px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl font-black text-sm sm:text-base transition-all shadow-sm active:scale-95 border ${
+            isCurrentPageSaved
+              ? 'bg-amber-500 text-stone-900 border-amber-600 shadow-amber-500/20'
+              : 'bg-stone-100 hover:bg-amber-100 text-stone-800 border-stone-300'
+          }`}
         >
-          <ArrowRight size={26} />
-          <span>المكتبة</span>
+          {isCurrentPageSaved ? (
+            <>
+              <BookmarkCheck className="w-5 h-5 text-stone-900 fill-stone-900" />
+              <span>محفوظ هنا ✓</span>
+            </>
+          ) : (
+            <>
+              <Bookmark className="w-5 h-5 text-amber-700" />
+              <span>حفظ الصفحة</span>
+            </>
+          )}
         </button>
 
-        <div className="flex-1 text-center px-2">
-          <h1 className="font-extrabold text-lg sm:text-xl truncate" title={book.title}>
+        {/* Book Title & Quick Jump Page Indicator */}
+        <div className="text-center flex-1 mx-2">
+          <h2 className="text-sm sm:text-lg font-black truncate max-w-[200px] sm:max-w-md mx-auto">
             {book.title}
-          </h1>
+          </h2>
           <button
-            onClick={() => setIsJumpModalOpen(true)}
-            className="text-sm sm:text-base font-bold mt-0.5 underline cursor-pointer active:opacity-70"
-            style={{ color: theme.subTextColor }}
+            onClick={() => {
+              setJumpPageInput(String(currentPage));
+              setIsJumpModalOpen(true);
+            }}
+            className="text-xs sm:text-sm font-bold opacity-80 hover:opacity-100 underline decoration-dotted transition-opacity"
           >
             صفحة {currentPage} من {totalPages} (انتقال سريع)
           </button>
         </div>
 
-        {/* Bookmark Ribbon */}
+        {/* Back to Library Button */}
         <button
-          onClick={toggleBookmark}
-          className="flex flex-col items-center justify-center min-w-[58px] min-h-[52px] rounded-2xl cursor-pointer active:scale-95 transition-transform"
-          style={{
-            backgroundColor: isBookmarked ? '#fef08a' : 'rgba(0,0,0,0.05)',
-            color: isBookmarked ? '#854d0e' : theme.textColor,
-          }}
-          aria-label={isBookmarked ? 'الصفحة محفوظة' : 'حفظ الصفحة'}
+          onClick={onBack}
+          className="flex items-center gap-1.5 px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl text-sm sm:text-base font-bold bg-stone-200/80 hover:bg-stone-300 text-stone-800 transition-colors active:scale-95"
         >
-          <Bookmark size={24} fill={isBookmarked ? '#ca8a04' : 'none'} />
-          <span className="text-xs font-black mt-0.5">{isBookmarked ? 'محفوظة' : 'حفظ'}</span>
+          <span>المكتبة</span>
+          <ArrowRight className="w-5 h-5" />
         </button>
       </header>
 
-      {/* 2. Page Canvas Area */}
-      <main className="flex-1 flex flex-col items-center justify-center p-3 sm:p-6 overflow-x-auto">
+      {/* Main Reading Area */}
+      <main className="flex-1 flex flex-col items-center justify-center p-2 sm:p-4 overflow-auto relative">
+        {/* Loading Spinner */}
+        {isRendering && (
+          <div className="absolute inset-0 bg-stone-100/60 backdrop-blur-xs flex items-center justify-center z-20">
+            <div className="bg-white/90 p-5 rounded-2xl shadow-xl flex flex-col items-center gap-3 border border-stone-200">
+              <div className="w-9 h-9 border-4 border-amber-600 border-t-transparent rounded-full animate-spin" />
+              <p className="text-sm sm:text-base font-bold text-stone-800">
+                جاري تجهيز صفحة الكتاب...
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Error Banner */}
+        {renderError && (
+          <div className="bg-red-50 text-red-800 p-5 rounded-2xl max-w-md text-center border-2 border-red-300 shadow-lg my-8">
+            <p className="font-bold text-lg mb-2">عذراً، تعذر عرض الصفحة</p>
+            <p className="text-sm opacity-90 mb-4">{renderError}</p>
+            <button
+              onClick={() => renderPage(mupdfDocRef.current, currentPage, zoomLevel)}
+              className="px-5 py-2 bg-red-600 text-white rounded-xl font-bold shadow hover:bg-red-700"
+            >
+              إعادة المحاولة
+            </button>
+          </div>
+        )}
+
+        {/* High-Fidelity Canvas with Hardware-Accelerated Eye-Care Filter */}
         <div
-          className="relative rounded-2xl shadow-xl overflow-hidden transition-all duration-150"
+          className="max-w-full flex justify-center transition-all duration-200"
           style={{
-            backgroundColor: theme.paperBg,
             filter: theme.canvasFilter,
           }}
         >
-          {isRendering && (
-            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-white/70 backdrop-blur-xs">
-              <div className="w-10 h-10 border-4 border-amber-600 border-t-transparent rounded-full animate-spin"></div>
-              <p className="mt-3 font-bold text-stone-800 text-lg">جاري تجهيز صفحة الكتاب...</p>
-            </div>
-          )}
-
-          <canvas ref={canvasRef} className="block max-w-full h-auto" />
+          <canvas
+            ref={canvasRef}
+            className="shadow-2xl rounded-sm max-w-full h-auto"
+            style={{
+              backgroundColor: theme.paperBg,
+            }}
+          />
         </div>
       </main>
 
-      {/* 3. Floating Quick Action Controls (+ / - / Theme) */}
-      <aside className="fixed bottom-24 right-4 z-40 flex flex-col gap-3">
+      {/* Floating Eye-Care & Zoom Side Toolbar */}
+      <aside className="fixed right-3 bottom-24 sm:right-6 sm:bottom-28 flex flex-col gap-2.5 z-30">
         <button
-          onClick={() => setZoomLevel((z) => Math.min(Number((z + 0.15).toFixed(2)), 2.2))}
-          className="w-14 h-14 sm:w-16 sm:h-16 rounded-full shadow-lg flex flex-col items-center justify-center font-bold active:scale-90 transition-transform cursor-pointer"
-          style={{ backgroundColor: theme.headerBg, color: theme.textColor }}
-          title="تكبير الصفحة"
-          aria-label="تكبير"
+          onClick={() => handleZoom(0.15)}
+          title="تكبير الخط"
+          className="w-12 h-12 sm:w-14 sm:h-14 bg-white/95 text-stone-800 rounded-full shadow-lg border border-stone-300 flex flex-col items-center justify-center hover:bg-amber-50 active:scale-90 transition-transform"
         >
-          <ZoomIn size={26} />
-          <span className="text-[10px] font-black">تكبير</span>
+          <ZoomIn className="w-5 h-5 sm:w-6 sm:h-6" />
+          <span className="text-[10px] font-bold">تكبير</span>
         </button>
 
         <button
-          onClick={() => setZoomLevel((z) => Math.max(Number((z - 0.15).toFixed(2)), 0.8))}
-          className="w-14 h-14 sm:w-16 sm:h-16 rounded-full shadow-lg flex flex-col items-center justify-center font-bold active:scale-90 transition-transform cursor-pointer"
-          style={{ backgroundColor: theme.headerBg, color: theme.textColor }}
-          title="تصغير الصفحة"
-          aria-label="تصغير"
+          onClick={() => handleZoom(-0.15)}
+          title="تصغير الخط"
+          className="w-12 h-12 sm:w-14 sm:h-14 bg-white/95 text-stone-800 rounded-full shadow-lg border border-stone-300 flex flex-col items-center justify-center hover:bg-amber-50 active:scale-90 transition-transform"
         >
-          <ZoomOut size={26} />
-          <span className="text-[10px] font-black">تصغير</span>
+          <ZoomOut className="w-5 h-5 sm:w-6 sm:h-6" />
+          <span className="text-[10px] font-bold">تصغير</span>
         </button>
 
         <button
-          onClick={() => setZoomLevel(1.15)}
-          className="w-14 h-14 sm:w-16 sm:h-16 rounded-full shadow-lg flex flex-col items-center justify-center font-bold active:scale-90 transition-transform cursor-pointer"
-          style={{ backgroundColor: theme.headerBg, color: theme.textColor }}
+          onClick={handleResetZoom}
           title="إعادة ضبط الحجم"
-          aria-label="الحجم الأصلي"
+          className="w-12 h-12 sm:w-14 sm:h-14 bg-white/95 text-stone-800 rounded-full shadow-lg border border-stone-300 flex flex-col items-center justify-center hover:bg-amber-50 active:scale-90 transition-transform"
         >
-          <RotateCcw size={22} />
-          <span className="text-[10px] font-black">ضبط</span>
+          <RotateCcw className="w-5 h-5 sm:w-6 sm:h-6" />
+          <span className="text-[10px] font-bold">ضبط</span>
         </button>
 
         <button
           onClick={() => setIsThemeModalOpen(true)}
-          className="w-14 h-14 sm:w-16 sm:h-16 rounded-full shadow-lg flex flex-col items-center justify-center font-bold active:scale-90 transition-transform cursor-pointer"
-          style={{ backgroundColor: theme.buttonBg, color: theme.buttonText }}
-          title="تغيير ألوان وإضاءة القراءة"
-          aria-label="المظهر"
+          title="مظهر وإضاءة القراءة"
+          className="w-12 h-12 sm:w-14 sm:h-14 bg-amber-700 text-white rounded-full shadow-xl flex flex-col items-center justify-center hover:bg-amber-800 active:scale-90 transition-transform border-2 border-amber-300"
         >
-          <Palette size={24} />
-          <span className="text-[10px] font-black">المظهر</span>
+          <Palette className="w-5 h-5 sm:w-6 sm:h-6" />
+          <span className="text-[10px] font-bold">المظهر</span>
         </button>
       </aside>
 
-      {/* 4. Giant Bottom Navigation Bar for Senior Ease (64px target height) */}
+      {/* Giant Elderly-Friendly Navigation Bottom Bar */}
       <footer
-        className="fixed bottom-0 left-0 right-0 z-30 flex items-center justify-between px-4 py-3 border-t shadow-2xl"
+        className="sticky bottom-0 z-40 px-3 py-3 sm:px-6 sm:py-4 shadow-2xl flex items-center justify-between gap-3 border-t"
         style={{
           backgroundColor: theme.headerBg,
-          borderColor: 'rgba(0,0,0,0.08)',
+          borderColor: 'rgba(0,0,0,0.1)',
         }}
       >
+        {/* Previous Page Button */}
         <button
-          onClick={handleNextPage}
-          disabled={currentPage >= totalPages}
-          className="flex-1 flex items-center justify-center gap-2 py-3.5 px-4 rounded-2xl font-black text-lg sm:text-xl active:scale-98 transition-transform cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
-          style={{ backgroundColor: theme.buttonBg, color: theme.buttonText }}
+          onClick={() => handlePageChange(currentPage - 1)}
+          disabled={currentPage <= 1}
+          className={`flex-1 py-3.5 sm:py-4 px-4 rounded-2xl font-black text-base sm:text-xl flex items-center justify-center gap-2 shadow-md transition-all active:scale-98 ${
+            currentPage <= 1
+              ? 'opacity-40 cursor-not-allowed bg-stone-300 text-stone-500'
+              : 'bg-amber-200 hover:bg-amber-300 text-amber-950 border border-amber-400'
+          }`}
         >
-          <span>التالي</span>
-          <ChevronLeft size={28} />
+          <ChevronRight className="w-6 h-6 sm:w-7 sm:h-7" />
+          <span>السابق</span>
         </button>
 
-        <div className="px-4 text-center font-black text-lg sm:text-xl" style={{ color: theme.textColor }}>
-          {currentPage} / {totalPages}
+        {/* Page Counter Badge */}
+        <div className="px-3 py-2 bg-stone-100/90 rounded-xl text-center min-w-[70px] sm:min-w-[90px] border border-stone-300">
+          <span className="text-sm sm:text-base font-black text-stone-800">
+            {currentPage} / {totalPages}
+          </span>
         </div>
 
+        {/* Next Page Button */}
         <button
-          onClick={handlePrevPage}
-          disabled={currentPage <= 1}
-          className="flex-1 flex items-center justify-center gap-2 py-3.5 px-4 rounded-2xl font-black text-lg sm:text-xl active:scale-98 transition-transform cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
-          style={{ backgroundColor: theme.buttonBg, color: theme.buttonText }}
+          onClick={() => handlePageChange(currentPage + 1)}
+          disabled={currentPage >= totalPages}
+          className={`flex-1 py-3.5 sm:py-4 px-4 rounded-2xl font-black text-base sm:text-xl flex items-center justify-center gap-2 shadow-md transition-all active:scale-98 ${
+            currentPage >= totalPages
+              ? 'opacity-40 cursor-not-allowed bg-stone-300 text-stone-500'
+              : 'bg-amber-800 hover:bg-amber-900 text-amber-50 border border-amber-900'
+          }`}
         >
-          <ChevronRight size={28} />
-          <span>السابق</span>
+          <span>التالي</span>
+          <ChevronLeft className="w-6 h-6 sm:w-7 sm:h-7" />
         </button>
       </footer>
 
-      {/* 5. Eye-Care Themes Modal */}
+      {/* Theme Selection Modal */}
       {isThemeModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
-          <div
-            className="w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl p-6 shadow-2xl max-h-[85vh] overflow-y-auto"
-            style={{ backgroundColor: theme.headerBg, color: theme.textColor }}
-          >
-            <h2 className="text-2xl font-black mb-4 text-center">ألوان وإضاءة راحة العينين</h2>
-            <div className="flex flex-col gap-3">
-              {(Object.keys(THEMES) as ThemeId[]).map((tid) => {
-                const item = THEMES[tid];
-                const active = tid === themeId;
-                return (
-                  <button
-                    key={tid}
-                    onClick={() => {
-                      setThemeId(tid);
-                      setIsThemeModalOpen(false);
-                    }}
-                    className="flex items-center justify-between p-4 rounded-2xl border-2 transition-all cursor-pointer text-right"
-                    style={{
-                      backgroundColor: item.bg,
-                      borderColor: active ? item.accent : 'transparent',
-                    }}
-                  >
-                    <div>
-                      <div className="font-extrabold text-lg" style={{ color: item.textColor }}>
-                        {item.name}
-                      </div>
-                      <div className="text-xs font-bold mt-1" style={{ color: item.subTextColor }}>
-                        {item.badge}
-                      </div>
-                    </div>
-                    {active && (
-                      <span
-                        className="px-3 py-1 rounded-full text-xs font-black text-white"
-                        style={{ backgroundColor: item.accent }}
-                      >
-                        مُفعل الآن
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+          <div className="bg-stone-50 rounded-3xl p-5 sm:p-6 max-w-sm w-full shadow-2xl border border-stone-200">
+            <h3 className="text-lg sm:text-xl font-black text-stone-900 mb-4 text-center">
+              اختر لون وإضاءة القراءة المريحة
+            </h3>
+            <div className="grid grid-cols-2 gap-3 mb-5">
+              {Object.values(THEMES).map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    setThemeId(t.id);
+                    setIsThemeModalOpen(false);
+                  }}
+                  className={`p-3 rounded-2xl flex flex-col items-center gap-1.5 border-2 transition-all ${
+                    themeId === t.id
+                      ? 'border-amber-600 ring-2 ring-amber-400 shadow-md scale-102'
+                      : 'border-stone-200 hover:border-stone-400'
+                  }`}
+                  style={{ backgroundColor: t.bg, color: t.textColor }}
+                >
+                  <span className="font-bold text-sm sm:text-base">{t.name}</span>
+                  <span className="text-[11px] opacity-75">{t.badge}</span>
+                </button>
+              ))}
             </div>
             <button
               onClick={() => setIsThemeModalOpen(false)}
-              className="mt-6 w-full py-3.5 rounded-2xl bg-stone-300 hover:bg-stone-400 font-extrabold text-stone-900 cursor-pointer text-lg"
+              className="w-full py-3 bg-stone-300 hover:bg-stone-400 text-stone-900 font-bold rounded-2xl text-center"
             >
               إغلاق
             </button>
@@ -393,17 +423,13 @@ export const Reader: React.FC<ReaderProps> = ({ book, onBack }) => {
         </div>
       )}
 
-      {/* 6. Jump to Page Dialog */}
+      {/* Jump to Page Modal */}
       {isJumpModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
-          <form
-            onSubmit={handleJumpToPage}
-            className="w-full max-w-sm rounded-3xl p-6 shadow-2xl"
-            style={{ backgroundColor: theme.headerBg, color: theme.textColor }}
-          >
-            <h3 className="text-2xl font-black mb-2 text-center">انتقال لصفحة محددة</h3>
-            <p className="text-sm font-bold text-center mb-4" style={{ color: theme.subTextColor }}>
-              أدخل رقم الصفحة من (1 إلى {totalPages})
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-xs w-full shadow-2xl border border-stone-200 text-center">
+            <h3 className="text-lg font-black text-stone-900 mb-2">انتقال لصفحة محددة</h3>
+            <p className="text-xs text-stone-500 mb-4">
+              أدخل رقم الصفحة من 1 إلى {totalPages}
             </p>
             <input
               type="number"
@@ -411,26 +437,30 @@ export const Reader: React.FC<ReaderProps> = ({ book, onBack }) => {
               max={totalPages}
               value={jumpPageInput}
               onChange={(e) => setJumpPageInput(e.target.value)}
-              placeholder={`مثال: ${Math.floor(totalPages / 2)}`}
-              className="w-full text-center text-3xl font-black p-3 rounded-2xl border-2 border-stone-400 bg-white text-stone-900 focus:outline-none focus:border-amber-600 mb-4"
+              className="w-full text-center text-2xl font-black p-3 border-2 border-amber-500 rounded-2xl mb-4 focus:outline-none focus:ring-4 focus:ring-amber-200"
               autoFocus
             />
-            <div className="flex gap-3">
+            <div className="flex gap-2">
               <button
-                type="submit"
-                className="flex-1 py-3 rounded-2xl font-black text-lg text-white bg-amber-700 active:scale-95 cursor-pointer"
+                onClick={() => {
+                  const num = parseInt(jumpPageInput, 10);
+                  if (!isNaN(num) && num >= 1 && num <= totalPages) {
+                    handlePageChange(num);
+                    setIsJumpModalOpen(false);
+                  }
+                }}
+                className="flex-1 py-3 bg-amber-700 text-white font-black rounded-xl hover:bg-amber-800 shadow"
               >
                 انتقال
               </button>
               <button
-                type="button"
                 onClick={() => setIsJumpModalOpen(false)}
-                className="flex-1 py-3 rounded-2xl font-black text-lg bg-stone-300 text-stone-900 cursor-pointer"
+                className="flex-1 py-3 bg-stone-200 text-stone-800 font-bold rounded-xl hover:bg-stone-300"
               >
                 إلغاء
               </button>
             </div>
-          </form>
+          </div>
         </div>
       )}
     </div>
