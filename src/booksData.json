@@ -1,0 +1,65 @@
+[
+  {
+    "id": "ajmal-adiah",
+    "title": "اجمل الأدعية ليوم عرفه",
+    "author": "مكتبة العائلة",
+    "filename": "ajmal-adiah.pdf",
+    "coverFilename": "ajmal-adiah-cover.jpg",
+    "totalPages": 45,
+    "fileSize": 2365048
+  },
+  {
+    "id": "al-tib-al-nabawi",
+    "title": "الطب النبوي",
+    "author": "ابن قيم الجوزية",
+    "filename": "al-tib-al-nabawi.pdf",
+    "coverFilename": "al-tib-al-nabawi-cover.jpg",
+    "totalPages": 335,
+    "fileSize": 8484740
+  },
+  {
+    "id": "sahih-muslim",
+    "title": "صحيح مسلم",
+    "author": "الإمام مسلم بن الحجاج",
+    "filename": "sahih-muslim.pdf",
+    "coverFilename": "sahih-muslim-cover.jpg",
+    "totalPages": 1473,
+    "fileSize": 38669981
+  },
+  {
+    "id": "tafsir-ibn-kathir",
+    "title": "تفسير القرآن العظيم (ابن كثير)",
+    "author": "الحافظ ابن كثير",
+    "filename": "tafsir-ibn-kathir.pdf",
+    "coverFilename": "tafsir-ibn-kathir-cover.jpg",
+    "totalPages": 2061,
+    "fileSize": 71661365
+  },
+  {
+    "id": "alsirah-ibn-hisham",
+    "title": "مختصر السيرة النبوية لابن هشام",
+    "author": "أبو محمد عبد الملك بن هشام",
+    "filename": "alsirah.pdf",
+    "coverFilename": "alsirah-cover.jpg",
+    "totalPages": 257,
+    "fileSize": 6405495
+  },
+  {
+    "id": "sahih-bukhari",
+    "title": "صحيح البخاري",
+    "author": "الإمام محمد بن إسماعيل البخاري",
+    "filename": "sahih-bukhari.pdf",
+    "coverFilename": "sahih-bukhari-cover.jpg",
+    "totalPages": 3172,
+    "fileSize": 63838723
+  },
+  {
+    "id": "adiah-arafah",
+    "title": "أدعية يوم عرفة",
+    "author": "مكتبة العائلة",
+    "filename": "adiah-arafah.pdf",
+    "coverFilename": "adiah-arafah-cover.jpg",
+    "totalPages": 5,
+    "fileSize": 1965222
+  }
+]

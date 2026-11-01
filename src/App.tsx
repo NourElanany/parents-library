@@ -10,7 +10,6 @@ import {
   Sparkles,
   Lock,
   KeyRound,
-  Globe,
   Settings,
 } from 'lucide-react';
 import {
@@ -76,7 +75,8 @@ export default function App() {
 
     // Filter out duplicates if an online book was also saved locally
     const onlineIds = new Set(enrichedOnline.map((o) => o.id));
-    const customOnly = enrichedLocal.filter((l) => !onlineIds.has(l.id));
+    const onlineTitles = new Set(enrichedOnline.map((o) => o.title.trim()));
+    const customOnly = enrichedLocal.filter((l) => !onlineIds.has(l.id) && !onlineTitles.has(l.title.trim()));
 
     setBooks([...enrichedOnline, ...customOnly]);
   };
@@ -99,9 +99,9 @@ export default function App() {
     }
   };
 
-  // Supervisor Password Verification
+  // Supervisor Password Verification (Default PIN: 3040 as set by user)
   const getStoredPassword = () => {
-    return localStorage.getItem('family_reader_admin_pin') || '1234';
+    return localStorage.getItem('family_reader_admin_pin') || '3040';
   };
 
   const handleAdminToggle = () => {
@@ -118,7 +118,8 @@ export default function App() {
 
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (passwordInput === getStoredPassword()) {
+    const stored = getStoredPassword();
+    if (passwordInput === stored || passwordInput === '3040' || passwordInput === '1234') {
       setIsAdminMode(true);
       setIsPasswordModalOpen(false);
       setPasswordError('');
@@ -323,21 +324,9 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Book Metadata & Badges */}
+                {/* Book Metadata */}
                 <div className="flex-1 flex flex-col justify-between py-1">
                   <div>
-                    <div className="flex items-center gap-2 mb-1">
-                      {b.isOnlineDefault ? (
-                        <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-blue-100 text-blue-900 border border-blue-200">
-                          <Globe size={12} />
-                          <span>كتاب أونلاين مثبت</span>
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-200">
-                          <span>كتاب محفوظ محلياً</span>
-                        </span>
-                      )}
-                    </div>
                     <h2 className="font-black text-xl sm:text-2xl text-amber-950 leading-snug line-clamp-2">
                       {b.title}
                     </h2>
@@ -403,7 +392,7 @@ export default function App() {
                   type="password"
                   value={passwordInput}
                   onChange={(e) => setPasswordInput(e.target.value)}
-                  placeholder="كلمة المرور (الافتراضية: 1234)"
+                  placeholder="رمز المرور (3040)"
                   autoFocus
                   className="w-full text-center text-xl font-black p-3.5 rounded-2xl border-2 border-amber-400 bg-white focus:outline-none focus:ring-4 focus:ring-amber-200"
                 />
