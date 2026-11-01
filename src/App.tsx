@@ -157,6 +157,9 @@ export default function App() {
       const firstPage = doc.loadPage(0);
       const pixmap = firstPage.toPixmap(mupdf.Matrix.scale(0.5, 0.5), mupdf.ColorSpace.DeviceRGB, false);
       const pngBytes = pixmap.asPNG();
+      pixmap.destroy();
+      firstPage.destroy();
+      doc.destroy();
       const blob = new Blob([pngBytes as any], { type: 'image/png' });
 
       const reader = new FileReader();
