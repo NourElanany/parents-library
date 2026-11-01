@@ -48,17 +48,20 @@ export default function App() {
 
   // Load books library (combining built-in online library with local uploaded books)
   const refreshBooks = async () => {
+    const deletedOnline: string[] = JSON.parse(localStorage.getItem('family_reader_deleted_online') || '[]');
     const localBooks = await getAllBooks();
     
     // Attach latest saved bookmark progress to each book
     const enrichedOnline = await Promise.all(
-      DEFAULT_ONLINE_BOOKS.map(async (b) => {
-        const prog = await getSavedProgress(b.id);
-        return {
-          ...b,
-          lastReadPage: prog?.lastReadPage || b.lastReadPage || 1,
-        };
-      })
+      DEFAULT_ONLINE_BOOKS
+        .filter((b) => !deletedOnline.includes(b.id))
+        .map(async (b) => {
+          const prog = await getSavedProgress(b.id);
+          return {
+            ...b,
+            lastReadPage: prog?.lastReadPage || b.lastReadPage || 1,
+          };
+        })
     );
 
     const enrichedLocal = await Promise.all(
@@ -209,7 +212,12 @@ export default function App() {
     e.stopPropagation();
     if (!isAdminMode) return;
 
-    if (confirm(`هل أنت متأكد من حذف كتاب "${title}" من المكتبة؟`)) {
+    if (confirm(`هل أنت متأكد من حذف كتاب "${title}" من المكتبة نهائياً؟`)) {
+      const deletedOnline: string[] = JSON.parse(localStorage.getItem('family_reader_deleted_online') || '[]');
+      if (!deletedOnline.includes(id)) {
+        deletedOnline.push(id);
+        localStorage.setItem('family_reader_deleted_online', JSON.stringify(deletedOnline));
+      }
       await deleteBook(id);
       await refreshBooks();
     }
@@ -360,8 +368,8 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Delete Button - ONLY VISIBLE IN SUPERVISOR MODE (Requirement from user) */}
-                {isAdminMode && !b.isOnlineDefault && (
+                {/* Delete Button - ONLY VISIBLE IN SUPERVISOR MODE */}
+                {isAdminMode && (
                   <button
                     onClick={(e) => handleDeleteBook(e, b.id, b.title)}
                     className="absolute top-3 left-3 p-2.5 rounded-xl bg-red-100 hover:bg-red-200 text-red-700 cursor-pointer transition-colors shadow-sm active:scale-90 z-10"
